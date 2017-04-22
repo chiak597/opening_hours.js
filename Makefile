@@ -1,6 +1,8 @@
+## vim: foldmarker={{{,}}} foldlevel=0 foldmethod=marker spell:
+
 ## Variables {{{
-SHELL   := /bin/bash
-NODE    ?= nodejs
+SHELL   := /bin/bash -o nounset -o pipefail -o errexit
+NODEJS  ?= nodejs
 SEARCH  ?= opening_hours
 VERBOSE ?= 1
 RELEASE_OPENPGP_FINGERPRINT ?= C505B5C93B0DB3D338A1B6005FE92C12EE88E1F0
@@ -44,7 +46,7 @@ MAKE_OPTIONS ?= --no-print-directory
 CHECK_LANG ?= 'en'
 ## }}}
 
-REPO_FILES ?= git ls-files -z | xargs --null -I '{}' find '{}' -type f -regextype posix-extended -not -regex '.*/?submodules/.*' -print0
+REPO_FILES ?= git ls-files -z | xargs --null -I '{}' find '{}' -type f -print0 | egrep -zZv '^(submodules|holidays/nominatim_cache).*$$'
 
 .PHONY: default
 default: list
@@ -57,13 +59,37 @@ list:
 	@$(MAKE) -pRrq -f $(lastword $(MAKEFILE_LIST)) : 2>/dev/null | awk -v RS= -F: '/^# File/,/^# Finished Make data base/ {if ($$1 !~ "^[#.]") {print $$1}}' | sort | egrep -v -e '^[^[:alnum:]]' -e '^$@$$' | sed 's/^/    /'
 ## }}}
 
+## defaults {{{
+.PHONY: build
+build: opening_hours.min.js
+
+.PHONY: check
+check: qa-quick check-diff check-package.json
+
+.PHONY: check-full
+check-full: clean check-diff-all check-package.json check-yaml check-html
+
+.PHONY: benchmark
+benchmark: benchmark-opening_hours.min.js
+
+.PHONY: clean
+clean: osm-tag-data-rm
+	rm -f *+deps.js *.min.js
+	rm -f README.html
+	rm -f taginfo_sources.json
+
+.PHONY: osm-tag-data-rm
+osm-tag-data-rm: osm-tag-data-taginfo-rm osm-tag-data-overpass-rm
+## }}}
+
+## dependencies {{{
 .PHONY: dependencies-get
 # npm-install-peers@0.1.0 does not work with NodeJs 0.10
 dependencies-get: package.json
 	git submodule update --init --recursive
-	npm install
 	jq -r '.peerDependencies | to_entries[] | .key + "@" + .value' package.json | xargs npm install
-	bower install
+	npm install
+	pip install --user yamllint
 
 # colors above v0.6.1 broke the 'bold' option. For what we need this package, v0.6.1 is more than sufficient.
 .PHONY: update-dependency-versions
@@ -77,55 +103,20 @@ list-dependency-versions: package.json
 .PHONY: dependencies-user-wide-get
 dependencies-user-wide-get:
 	npm install --global doctoc npm-check-updates
-
-.PHONY: build
-build: opening_hours.min.js
-
-.PHONY: check
-check: check-diff check-package.json
-
-.PHONY: check-full
-check-full: check-diff-all check-package.json
-
-.PHONY: benchmark
-benchmark: benchmark-opening_hours.min.js
-
-README.html: README.md
+## }}}
 
 taginfo.json: related_tags.txt gen_taginfo_json.js taginfo_template.json
 	gen_taginfo_json.js --key-file "$<" --template-file taginfo_template.json > "$@"
 	## Haxe implementation produces a different sorted JSON.
 	# haxe -main Gen_taginfo_json -lib mcli -neko Gen_taginfo_json.n && neko Gen_taginfo_json --key_file "$<" --template_file taginfo_template.json > "$@"
 
+## docs {{{
+README.html: README.md
+
 .PHONY: doctoc
 doctoc:
 	doctoc README.md --title '**Table of Contents**'
-
-.PHONY: release
-## First source file is referenced!
-## Might be better: https://docs.npmjs.com/cli/version
-release: package.json update-dependency-versions doctoc check-diff-uglifyjs-log check qa-source-code qa-https-everywhere
-	git status
-	@echo Update changelog.
-	read continue
-	@echo Increase version.
-	jq --raw-output '.version' $<
-	read continue
-	$(MAKE) $(MAKE_OPTIONS) check-package.json
-	git commit --all --message="Release version $(shell jq --raw-output '.version' '$<')"
-	git tag --sign --local-user "$(RELEASE_OPENPGP_FINGERPRINT)" "v$(shell jq --raw-output '.version' $<)"
-	git push --follow-tags
-	npm publish
-	# $(MAKE) $(MAKE_OPTIONS) publish-website-on-all-servers
-
-.PHONY: clean
-clean: osm-tag-data-rm
-	rm -f *+deps.js *.min.js
-	rm -f README.html
-	rm -f taginfo_sources.json
-
-.PHONY: osm-tag-data-rm
-osm-tag-data-rm: osm-tag-data-taginfo-rm osm-tag-data-overpass-rm
+## }}}
 
 ## Build files which are needed to host the evaluation tool on a webserver.
 .PHONY: ready-for-hosting
@@ -134,22 +125,30 @@ ready-for-hosting: dependencies-get opening_hours+deps.min.js
 ## command line programs {{{
 .PHONY: run-regex_search
 run-regex_search: export.$(SEARCH).json interactive_testing.js regex_search.py
-	$(NODE) ./regex_search.py "$<"
+	$(NODEJS) ./regex_search.py "$<"
 
 .PHONY: run-interactive_testing
-run-interactive_testing: interactive_testing.js
-	$(NODE) "$<" --locale $(CHECK_LANG)
+run-interactive_testing: interactive_testing.js opening_hours.js
+	$(NODEJS) "$<" --locale "$(CHECK_LANG)"
 ## }}}
 
 ## Source code QA {{{
-.PHONY: qa-source-code qa-https-everywhere
-qa-source-code:
-	$(REPO_FILES) | egrep --null-data '\.js$$' --null | xargs -0 sed -i 's/\([^=!]\)==\([^=]\)/\1===\2/g;s/\([^=!]\)!=\([^=]\)/\1!==\2/g;'
+.PHONY: qa-quick
+qa-quick: qa-phrases-to-avoid
 
+.PHONY: qa-phrases-to-avoid
+qa-phrases-to-avoid:
+	! git grep --ignore-case 'input[ ]tolerance'
+
+.PHONY: qa-source-code
+qa-source-code:
+	$(REPO_FILES) | egrep --null-data '\.js$$' --null | xargs --null sed -i 's/\([^=!]\)==\([^=]\)/\1===\2/g;s/\([^=!]\)!=\([^=]\)/\1!==\2/g;'
+
+.PHONY: qa-https-everywhere
 qa-https-everywhere:
-	$(REPO_FILES) | xargs -0 sed --regexp-extended --in-place 's#http(:\\?/\\?/)(overpass-turbo\.eu|www\.gnu\.org|stackoverflow\.com|openstreetmap\.org|www\.openstreetmap\.org|nominatim\.openstreetmap\.org|taginfo\.openstreetmap\.org|wiki\.openstreetmap\.org|josm.openstreetmap.de|www.openstreetmap.org\\/copyright)#https\1\2#g;'
-	$(REPO_FILES) | xargs -0 sed -i 's#http://overpass-api.de/#https://overpass-api.de/#g;'
-	$(REPO_FILES) | xargs -0 sed --regexp-extended --in-place 's#http://(\w+\.wikipedia\.org)#https://\1#g;'
+	$(REPO_FILES) | xargs --null sed --regexp-extended --in-place 's#http(:\\?/\\?/)(momentjs\.com|overpass-turbo\.eu|www\.gnu\.org|stackoverflow\.com|(:?www\.)?openstreetmap\.(org|de)|nominatim\.openstreetmap\.org|taginfo\.openstreetmap\.org|wiki\.openstreetmap\.org|josm.openstreetmap.de|www.openstreetmap.org\\/copyright|github\.com|xkcd\.com|www\.heise\.de|www\.readthedocs\.org|askubuntu\.com|xpra\.org|docker\.com|linuxcontainers\.org|www\.ecma-international\.org|www\.w3\.org|example\.com|www\.example\.com)#https\1\2#g;'
+	$(REPO_FILES) | xargs --null sed -i 's#http://overpass-api\.de#https://overpass-api.de#g;'
+	$(REPO_FILES) | xargs --null sed --regexp-extended --in-place 's#http://(\w+\.wikipedia\.org)#https://\1#g;'
 	test -f index.html && git checkout index.html
 	# ack 'http://'
 ## }}}
@@ -173,7 +172,7 @@ check-diff: check-diff-all-opening_hours.js
 check-diff-uglifyjs-log: uglifyjs.log
 	git --no-pager diff -- "$<"
 	git diff --quiet --exit-code HEAD -- "$<" || read fnord; \
-	if [ "$$fnord" == "b" ]; then \
+	if [ "$${fnord:-}" == "b" ]; then \
 		exit 1; \
 	fi
 
@@ -189,15 +188,13 @@ check-opening_hours.js:
 check-opening_hours.min.js:
 
 check-%.js: %.js test.js
-	-$(NODE) test.js "./$<"
+	$(NODEJS) test.js "./$<"
 
 check-diff-all-opening_hours.js:
 check-diff-all-opening_hours.min.js:
 
 check-diff-all-%.js: %.js test.js
-	@for lang in en de; do \
-		$(MAKE) $(MAKE_OPTIONS) CHECK_LANG=$$lang check-diff-opening_hours.js; \
-	done
+	@echo -n "en de" | xargs --delimiter ' ' --max-args=1 -I '{}' $(MAKE) $(MAKE_OPTIONS) "CHECK_LANG={}" check-diff-opening_hours.js
 
 .SILENT: check-diff-opening_hours.js check-diff-opening_hours.min.js
 check-diff-en-opening_hours.js: check-diff-opening_hours.js
@@ -205,22 +202,20 @@ check-diff-de-opening_hours.js:
 	$(MAKE) $(MAKE_OPTIONS) CHECK_LANG=de check-diff-opening_hours.js
 
 check-diff-%.js: %.js test.js
-	$(NODE) test.js --library-file "$<" --locale $(CHECK_LANG) 1> test.$(CHECK_LANG).log 2>&1; \
-	git diff --quiet --exit-code HEAD -- test.$(CHECK_LANG).log; \
-	if [ "$$?" == "0" ]; then \
+	rm -rf "test.$(CHECK_LANG).log"
+	$(NODEJS) test.js --library-file "$<" --locale $(CHECK_LANG) 1> test.$(CHECK_LANG).log 2>&1 || true; \
+	if git diff --quiet --exit-code HEAD -- "test.$(CHECK_LANG).log"; then \
 		echo "Test results for $< ($(CHECK_LANG)) are exactly the same as on developemt system. So far, so good ;)"; \
 	else \
 		echo "Test results for $< ($(CHECK_LANG)) produced a different output then the output of the current HEAD. Checkout the following diff."; \
 	fi
-	git --no-pager diff -- test.$(CHECK_LANG).log
-	## This would allow no diff at all which means no changes to the test framework …
-	# git --no-pager diff --exit-code -- test.$(CHECK_LANG).log
+	sh -c 'git --no-pager diff --exit-code -- "test.$(CHECK_LANG).log"'
 
 .PHONY: osm-tag-data-taginfo-check
 osm-tag-data-taginfo-check: real_test.js opening_hours.js osm-tag-data-get-taginfo
-	$(NODE) ./check_for_new_taginfo_data.js --exit-code-not-new 0
+	$(NODEJS) ./check_for_new_taginfo_data.js --exit-code-not-new 0
 	@grep -v '^#' $(OH_RELATED_TAGS) | while read key; do \
-		$(NODE) "$<" $(REAL_TEST_OPTIONS) --map-bad-oh-values --ignore-manual-values "export.$$key.json"; \
+		$(NODEJS) "$<" $(REAL_TEST_OPTIONS) --map-bad-oh-values --ignore-manual-values "export.$$key.json"; \
 	done
 
 .PHONY: osm-tag-data-update-check
@@ -232,12 +227,46 @@ benchmark-opening_hours.min.js:
 
 # .PHONY: benchmark
 benchmark-%.js: %.js benchmark.js
-	$(NODE) ./benchmark.js "$<"
+	$(NODEJS) ./benchmark.js "./$<"
 
 .PHONY: check-package.json
 check-package.json: package.json
 	pjv --warnings --recommendations --filename "$<"
 
+.PHONY: check-yaml
+check-yaml:
+	$(REPO_FILES) | xargs --null -I '{}' find '{}' -type f -regextype posix-extended -regex '.*\.(yml|yaml)$$' -print0 | xargs --null yamllint --strict
+
+.PHONY: check-html
+check-html:
+	html5validator --show-warnings --root . --blacklist node_modules submodules
+
+## }}}
+
+## release {{{
+
+.PHONY: release-versionbump
+release-versionbump: package.json bower.json CHANGELOG.rst
+	editor $?
+	sh -c 'git commit --all --message "Release version $$(jq --raw-output '.version' '$<')"'
+
+.PHONY: release-prepare
+release-prepare: package.json taginfo.json update-dependency-versions doctoc check-diff-uglifyjs-log check qa-source-code qa-https-everywhere
+
+.PHONY: release-local
+release-local: package.json release-versionbump check-package.json
+	git tag --sign --local-user "$(RELEASE_OPENPGP_FINGERPRINT)" --message "Released version $(shell jq --raw-output '.version' $<)" "v$(shell jq --raw-output '.version' $<)"
+
+.PHONY: release-publish
+## First source file is referenced!
+## Might be better: https://docs.npmjs.com/cli/version
+release-publish:
+	git push --follow-tags
+	npm publish
+	# $(MAKE) $(MAKE_OPTIONS) publish-website-on-all-servers
+
+.PHONY: release
+release: release-prepare release-local release-publish
 ## }}}
 
 ## OSM data from taginfo {{{
@@ -252,7 +281,7 @@ osm-tag-data-update-taginfo: taginfo_sources.json osm-tag-data-taginfo-rm osm-ta
 ## Always refresh
 .PHONY: taginfo_sources.json
 taginfo_sources.json:
-	$(NODE) ./check_for_new_taginfo_data.js
+	$(NODEJS) ./check_for_new_taginfo_data.js
 
 .PHONY: osm-tag-data-get-taginfo
 osm-tag-data-get-taginfo: $(OH_RELATED_TAGS)
@@ -310,7 +339,7 @@ export♡%.json: real_test.js $(OH_RELATED_TAGS)
 			echo "[out:json][timeout:$(OVERPASS_QUERY_TIMEOUT)];"; \
 			echo "area[\"type\"=\"boundary\"][\"$$boundary_key\"=\"$$boundary_value\"];"; \
 			echo 'foreach('; \
-			for type in node way; do \
+			for type in NODEJS way; do \
 			if [ "$(OVERPASS_QUERY_USE_REGEX)" -eq "1" ]; then \
 				echo -n "    $$type(area)[~\"^("; \
 				(grep -v '^#' $(OH_RELATED_TAGS) | while read key; do \
@@ -330,7 +359,7 @@ export♡%.json: real_test.js $(OH_RELATED_TAGS)
 			fi; \
 			time wget $(WGET_OPTIONS) --post-file="$(TMP_QUERY)" --output-document="$(shell echo "$@" | sed 's/\\//g' )" "$(API_URL_OVERPASS)/interpreter" 2>&1; \
 			if [ "$$?" != "0" ]; then exit 1; fi; \
-			$(NODE) "$<" $(REAL_TEST_OPTIONS) --map-bad-oh-values "$(shell echo "$@" | sed 's/\\//g' )"; \
+			$(NODEJS) "$<" $(REAL_TEST_OPTIONS) --map-bad-oh-values "$(shell echo "$@" | sed 's/\\//g' )"; \
 			find . -name "export♡*♡$$boundary_key♡$$boundary_value♡stats.csv" | while read file; do \
 				sort --numeric-sort "$$file" > "$$file.tmp" && \
 				mv "$$file.tmp" "$$file"; \
@@ -478,10 +507,13 @@ osm-tag-data-gen-stats-sort:
 	done
 ## }}}
 
-opening_hours+deps.js:
+.PHONY: opening_hours.js
+opening_hours.js:
+	DEPS=NO ./node_modules/.bin/rollup -c
 
-%+deps.js: %.js
-	./node_modules/.bin/browserify --require moment --require i18next-client --require "./$<:opening_hours" --outfile "$@"
+.PHONY: opening_hours+deps.js
+opening_hours+deps.js:
+	DEPS=YES ./node_modules/.bin/rollup -c
 
 uglifyjs.log: opening_hours.js
 	uglifyjs "$<" --lint 1>/dev/zero 2>uglifyjs.log
